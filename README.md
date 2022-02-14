@@ -32,6 +32,7 @@ If your account is secured with MFA, you may need to generate a short lived
 access token and export environment variables. If this is the case, use the
 -e flag to use the environment variables.
 
+Example of how to generate access token:
 ```
 aws sts get-session-token --serial-number <arn-for-mfa> --duration-seconds 3600 --token-code <token-from-device> --profile <if-not-default-profle>
 ```

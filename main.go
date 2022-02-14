@@ -7,8 +7,9 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -16,52 +17,109 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/lambda"
-	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 )
 
 var (
-	// Sess        *session.Session
 	profileFlag string
 	envFlag     bool
 	regionFlag  string
 	debugFlag   bool
-	regions     []string
 )
 
+const secondsInDay = 86400
+const days = 28
+
+// Goroutine results
+var results = make(map[int]interface{})
+
+var regions = []string{
+	"af-south-1",
+	"ap-east-1",
+	"ap-northeast-1",
+	"ap-northeast-2",
+	"ap-northeast-3",
+	"ap-southeast-1",
+	"ap-southeast-2",
+	"ap-south-1",
+	"ap-southeast-3",
+	"ca-central-1",
+	"eu-central-1",
+	"eu-north-1",
+	"eu-south-1",
+	"eu-west-1",
+	"eu-west-2",
+	"eu-west-3",
+	"me-south-1",
+	"sa-east-1",
+	"us-east-1",
+	"us-east-2",
+	"us-west-1",
+	"us-west-2",
+}
+
+func worker(region string, wg *sync.WaitGroup, id int) {
+	defer wg.Done()
+
+	output := getLambdaStatsByRegion(region)
+
+	results[id] = output
+}
+
 func getLambdaStats() {
+	output := ""
+
 	fmt.Println("Lambda invocation stats for last 28 days")
 	fmt.Println("----------------------------------------")
 	fmt.Println()
+
 	if regionFlag == "all" {
+		var wg sync.WaitGroup
+
 		for i := 0; i < len(regions); i++ {
-			getLambdaStatsByRegion(regions[i])
+			wg.Add(1)
+
+			go worker(regions[i], &wg, i)
+		}
+
+		wg.Wait()
+
+		for _, result := range results {
+			output += fmt.Sprintf("%v", result)
 		}
 	} else {
-		getLambdaStatsByRegion(regionFlag)
+		output = getLambdaStatsByRegion(regionFlag)
 	}
+
+	fmt.Printf("%v", output)
 }
 
-func getLambdaStatsByRegion(region string) {
+func getLambdaStatsByRegion(region string) string {
+	output := ""
+
 	lambdas, err := listLambdas(region)
+
 	if err != nil {
-		log.Printf("Could not get lambdas in %v\n\n", region)
+		output += fmt.Sprintf("Could not get lambdas in %v\n\n", region)
+
 		if debugFlag {
-			log.Printf("%v\n", err)
+			output += fmt.Sprintf("%v\n", err)
 		}
-		return
+
+		return output
 	}
 
-	fmt.Printf("%v Lambda functions found in %v\n", len(lambdas.Functions), region)
+	output += fmt.Sprintf("%v Lambda functions found in %v\n", len(lambdas.Functions), region)
 
 	if len(lambdas.Functions) == 0 {
-		fmt.Println()
-		return
+		output += fmt.Sprintln()
+		return output
 	}
 
-	t := table.NewWriter()
-	t.SetOutputMirror(os.Stdout)
-	t.AppendHeader(table.Row{"Function", "Type", "Invocations"})
+	tableString := &strings.Builder{}
+	t := tablewriter.NewWriter(tableString)
+	t.SetHeader([]string{"Function", "Type", "Invocations"})
 
 	for i := 0; i < len(lambdas.Functions); i++ {
 		/*
@@ -74,8 +132,8 @@ func getLambdaStatsByRegion(region string) {
 		*/
 		metricData, err := getMetricData(*lambdas.Functions[i].FunctionName, region)
 		if err != nil {
-			log.Printf("Could not get metrics: %v", err)
-			return
+			output += fmt.Sprintf("Could not get metrics: %v", err)
+			return output
 		}
 
 		var invocationCount float64
@@ -86,13 +144,14 @@ func getLambdaStatsByRegion(region string) {
 			}
 		}
 
-		t.AppendRows([]table.Row{
-			{*lambdas.Functions[i].FunctionName, *lambdas.Functions[i].Runtime, invocationCount},
-		})
+		t.AppendBulk([][]string{{*lambdas.Functions[i].FunctionName, *lambdas.Functions[i].Runtime, fmt.Sprintf("%v", invocationCount)}})
 	}
 
 	t.Render()
-	fmt.Println()
+
+	output += fmt.Sprintf("%v\n", tableString.String())
+
+	return output
 }
 
 func getMetricData(functionName, region string) (*cloudwatch.GetMetricDataOutput, error) {
@@ -111,7 +170,7 @@ func getMetricData(functionName, region string) (*cloudwatch.GetMetricDataOutput
 			Namespace:  aws.String("AWS/Lambda"),
 			MetricName: aws.String("Invocations"),
 		},
-		Period: aws.Int64(86400 * 28), // 28 days
+		Period: aws.Int64(secondsInDay * days),
 		Stat:   aws.String("Sum"),
 		Unit:   aws.String("Count"),
 	}
@@ -128,7 +187,7 @@ func getMetricData(functionName, region string) (*cloudwatch.GetMetricDataOutput
 	input := &cloudwatch.GetMetricDataInput{}
 	input.SetMetricDataQueries(queries)
 	input.SetEndTime(time.Now())
-	input.SetStartTime(time.Now().AddDate(-0, -0, -28))
+	input.SetStartTime(time.Now().AddDate(-0, -0, -days))
 
 	result, err := svc.GetMetricData(input)
 	if err != nil {
@@ -213,17 +272,11 @@ func Session(region string) *session.Session {
 	verboseCredentialErrors := true
 
 	sessionOpts := session.Options{
-		// Specify profile to load for the session's config
-		// Profile: profile,
-
 		// Provide SDK Config options, such as Region.
 		Config: aws.Config{
 			Region:                        aws.String(region),
 			CredentialsChainVerboseErrors: &verboseCredentialErrors,
 		},
-
-		// Force enable Shared Config support
-		// SharedConfigState: session.SharedConfigEnable,
 	}
 
 	if !envFlag {
@@ -240,31 +293,6 @@ func Session(region string) *session.Session {
 }
 
 func main() {
-	regions = []string{
-		"af-south-1",
-		"ap-east-1",
-		"ap-northeast-1",
-		"ap-northeast-2",
-		"ap-northeast-3",
-		"ap-southeast-1",
-		"ap-southeast-2",
-		"ap-south-1",
-		"ap-southeast-3",
-		"ca-central-1",
-		"eu-central-1",
-		"eu-north-1",
-		"eu-south-1",
-		"eu-west-1",
-		"eu-west-2",
-		"eu-west-3",
-		"me-south-1",
-		"sa-east-1",
-		"us-east-1",
-		"us-east-2",
-		"us-west-1",
-		"us-west-2",
-	}
-
 	var rootCmd = &cobra.Command{
 		Use:   "lambda-invocations",
 		Short: "List the number of invocations per AWS lambda in a region",
